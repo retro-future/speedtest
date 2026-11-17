@@ -11,6 +11,9 @@ import httpx
 
 DEFAULT_REQUESTS = 10
 DEFAULT_TIMEOUT = 30.0
+DEFAULT_RETRIES = 2
+RETRY_BASE_DELAY = 0.5
+RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 DEFAULT_USER_AGENT = "speedtest-cli/0.1 (https://github.com/retro-future/speedtest)"
 CHUNK_SIZE = 64 * 1024  # 64 КБ
 
@@ -37,6 +40,35 @@ def fetch_once(client: httpx.Client, url: str) -> tuple[int, float]:
     return downloaded, elapsed
 
 
+def fetch_with_retry(
+    client: httpx.Client,
+    url: str,
+    retries: int,
+    retry_delay: float = RETRY_BASE_DELAY,
+) -> tuple[int, float]:
+    """Выполняет GET-запрос с повторами при временных сетевых сбоях и HTTP 429/5xx."""
+    for attempt in range(retries + 1):
+        try:
+            return fetch_once(client, url)
+        except httpx.HTTPStatusError as err:
+            if err.response.status_code not in RETRYABLE_STATUS_CODES or attempt == retries:
+                raise
+            reason = f"HTTP {err.response.status_code}"
+        except httpx.RequestError as err:
+            if attempt == retries:
+                raise
+            reason = str(err)
+
+        delay = retry_delay * (attempt + 1)
+        print(
+            f"  Повтор {attempt + 1}/{retries} через {delay:.1f} с ({reason})...",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    raise RuntimeError("Недостижимое состояние при выполнении повторов")
+
+
 def format_bytes(num_bytes: int) -> str:
     """Форматирует объём данных в байтах в человекочитаемый вид (десятичные единицы)."""
     if num_bytes < 1_000:
@@ -53,6 +85,7 @@ def run_benchmark(
     requests_count: int,
     timeout: float,
     user_agent: str,
+    retries: int = DEFAULT_RETRIES,
 ) -> None:
     """Выполняет серию последовательных запросов и выводит статистику скорости."""
     print(f"Цель: {url}")
@@ -72,7 +105,7 @@ def run_benchmark(
         headers=headers,
     ) as client:
         for idx in range(1, requests_count + 1):
-            size_bytes, elapsed = fetch_once(client, url)
+            size_bytes, elapsed = fetch_with_retry(client, url, retries)
             total_bytes += size_bytes
             total_time += elapsed
             request_times.append(elapsed)
@@ -121,6 +154,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Таймаут одного запроса в секундах (по умолчанию: {DEFAULT_TIMEOUT})",
     )
     parser.add_argument(
+        "-r",
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help=f"Количество повторов при временных сбоях (по умолчанию: {DEFAULT_RETRIES})",
+    )
+    parser.add_argument(
         "-A",
         "--user-agent",
         default=DEFAULT_USER_AGENT,
@@ -147,8 +187,12 @@ def main(argv: list[str] | None = None) -> int:
         print("Ошибка: таймаут должен быть положительным числом.", file=sys.stderr)
         return 2
 
+    if args.retries < 0:
+        print("Ошибка: количество повторов не может быть отрицательным.", file=sys.stderr)
+        return 2
+
     try:
-        run_benchmark(url, args.requests, args.timeout, args.user_agent)
+        run_benchmark(url, args.requests, args.timeout, args.user_agent, args.retries)
     except httpx.HTTPStatusError as err:
         print(
             f"\nОшибка HTTP {err.response.status_code}: {err.response.reason_phrase}",
